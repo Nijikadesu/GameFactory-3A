@@ -21,6 +21,10 @@ Game plan → game-cg-director → cg_tasks.jsonl
 | Harness | `<REPO_PATH>/test/harness/` | CPU-only, network-free chain validation |
 | Director sub-Skill | `<REPO_PATH>/agent_skills/asset_qa/cg_video/game-cg-director/` | Model-specific storyboard prompts and validated task rows |
 
+Paths in this Skill are written from the repository root. Resolve every
+`<REPO_PATH>/...` from there, and run every `bash` and `python` command below
+with `<REPO_PATH>/` as the working directory.
+
 Standard artifact layout:
 
 ```text
