@@ -152,6 +152,18 @@ The request body contains `game_id`, `task_id`, optional `run_id`, `backend`,
 `failed`); a ready response includes `video.artifact_id`, `video.media_type`,
 and `video.url`, with the same public descriptor listed in `artifacts`.
 
+`(game_id, task_id)` identifies the clip and its `cg_tasks.jsonl` row defines it,
+so `generate` looks for a stored artifact before it generates one: an in-flight
+repeat joins that job, and a materialised clip whose definition still matches
+answers `ready` on the first response without using the GPU. A hit still returns
+HTTP 202, and shows in the payload as the *stored* `run_id` and
+`video.artifact_id`. Matching compares effective values, because `meta.json`
+records post-default ones and local generation is not deterministic, so reuse is
+the only way to get the same clip back. A stored artifact only counts as a hit if
+its `meta.json` records a real generation (`model_call.runtime`), so a stand-in's
+output is never served back. `options.reuse: false` forces a generation and a
+pinned `run_id` scopes the lookup to one run.
+
 Game-specific actions remain owned by the generated Mechanic contract.
 
 ## Browser HTTP API
@@ -310,6 +322,9 @@ still decides when a clip is meaningful and how it is presented.
   `true`).
 - `A3GAME_BROWSER_CG_VIDEO_ALLOW_CLOUD` - Explicitly permits cloud video
   requests (default `false`).
+- `A3GAME_BROWSER_CG_VIDEO_PREBUILT_ONLY` - Serves stored artifacts only; a
+  clip with no stored artifact fails the request instead of generating it
+  (default `false`).
 - `A3GAME_BROWSER_CG_VIDEO_MAX_WORKERS` - Maximum concurrent CG-video jobs
   (default `1`).
 
