@@ -68,13 +68,14 @@ envelopes. Do not represent several independently generated clips as one task.
      `reference_to_video`;
    - never select or mention the excluded last-frame-only mode.
 3. Use the requested model, normalized to lowercase; otherwise use `h3`. Read
-   `<REPO_PATH>/models/<model>.md`. If the profile does not exist, stop instead of
-   inventing one.
+   this Skill's `models/<model>.md`. If the profile does not exist, stop instead
+   of inventing one.
 
 ## Read only the selected guidance
 
 Treat the model profile as output dialect and the selected scene template as
-the game-CG task layer. Read these files in order:
+the game-CG task layer. Read these files in order; every path below is relative
+to this Skill's directory:
 
 1. `common/principles.md`
 2. `common/camera.md`
@@ -82,7 +83,7 @@ the game-CG task layer. Read these files in order:
 4. `common/style-mapping.md` only when the request contains a style term
 5. exactly one `modes/<mode>.md`: `t2va`, `i2va`, `fl2va`, or `ref2va`
 6. exactly one `templates/<scene>.md`
-7. `<REPO_PATH>/models/<model>.md`
+7. `models/<model>.md`
 
 Do not preload sibling modes or scenes. Write prompt prose in English. Preserve
 user-supplied dialogue, lyrics, and visible scene text verbatim and format them
