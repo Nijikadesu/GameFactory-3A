@@ -70,8 +70,14 @@ ALLOWED_OPTION_KEYS = frozenset(
         "prompt_optimizer",
         "fast_pretreatment",
         "verbose",
+        # Request-level switch, not a generation input: popped in ``submit`` before
+        # it can reach the model cache key or the model factory kwargs.
+        "reuse",
     }
 )
+# The task fields a stored artifact must agree on before it may be reused.  A
+# ``meta.json`` without these cannot be trusted to describe the current task.
+REUSE_REQUIRED_TASK_FIELDS = ("mode", "prompt", "duration_sec", "seed")
 
 
 class CgVideoError(BrowserServingError):
@@ -126,6 +132,9 @@ class _CgVideoJob:
     playback: dict[str, bool] = field(default_factory=dict)
     created_at: float = field(default_factory=time)
     updated_at: float = field(default_factory=time)
+    # Internal: the in-flight coalescing key this job reserved, cleared when the
+    # job stops running.  Never part of ``to_dict``.
+    inflight_key: tuple[Any, ...] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -158,7 +167,9 @@ class CgVideoGateway:
     """Queue CG-video tasks and materialize standard task artifacts.
 
     Model construction is lazy and injectable.  The default factory loads the
-    repository's H3 or Seedance model wrapper only when a job starts.
+    repository's H3 or Seedance model wrapper only when a job starts.  With
+    ``prebuilt_only`` a job never gets that far: the gateway serves the clips
+    production generated and reports a missing one instead.
     """
 
     def __init__(
@@ -166,6 +177,7 @@ class CgVideoGateway:
         *,
         enabled: bool = True,
         allow_cloud: bool = False,
+        prebuilt_only: bool = False,
         max_workers: int = 1,
         output_root: str | Path | None = None,
         model_factory: Callable[[str, Mapping[str, Any], Mapping[str, Any]], Any]
@@ -177,6 +189,7 @@ class CgVideoGateway:
             raise ValueError("max_workers must be positive")
         self._enabled = bool(enabled)
         self.allow_cloud = bool(allow_cloud)
+        self.prebuilt_only = bool(prebuilt_only)
         self.output_root = Path(output_root or paths.OUTPUT_ROOT).expanduser().resolve(
             strict=False
         )
@@ -188,6 +201,7 @@ class CgVideoGateway:
         )
         self._jobs: dict[str, _CgVideoJob] = {}
         self._idempotency: dict[str, str] = {}
+        self._inflight: dict[tuple[Any, ...], str] = {}
         self._artifacts: dict[str, Path] = {}
         self._models: dict[str, Any] = {}
         self._lock = RLock()
@@ -217,7 +231,18 @@ class CgVideoGateway:
         options: Mapping[str, Any] | None = None,
         playback: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """Accept one task identity and return a queued job descriptor."""
+        """Accept one task identity and return a job descriptor.
+
+        A repeat request for a ``(game_id, task_id)`` whose stored artifact still
+        matches the current task definition returns ``status == "ready"`` on the
+        first response without occupying the GPU.  The route still answers 202
+        (the browser contract), so a reuse hit and a fresh generation are
+        indistinguishable to the caller except by ``run_id`` and latency.
+
+        With ``prebuilt_only`` that generation step is removed rather than
+        deferred: a miss ends the job as ``failed``, so a page load can never
+        spend a GPU minute on a clip production was supposed to have generated.
+        """
 
         if not self.enabled:
             raise CgVideoError("CG-video generation is disabled")
@@ -225,13 +250,32 @@ class CgVideoGateway:
         resolved_task = _identity(task_id, "task_id")
         task = self._load_task(resolved_game, resolved_task)
         resolved_options = _options(options)
+        # A request-level switch, not a generation input: drop it before it can
+        # reach `_get_model`'s cache key or the model factory kwargs, so asking
+        # for a regeneration cannot also fork a second cached model instance.
+        reuse_requested = bool(resolved_options.pop("reuse", True))
         resolved_playback = _playback(playback)
         resolved_backend = self._resolve_backend(task, backend)
+        # Validation stays ahead of every dedupe path, so an artifact is never
+        # served for a task definition that no longer validates.
         self._validate_task(task, resolved_backend, resolved_options)
         self._check_cloud_policy(resolved_backend, resolved_options)
 
-        resolved_run = _run_id(run_id)
-        key = str(idempotency_key or "").strip()
+        idem_key = str(idempotency_key or "").strip()
+        # The run id is resolved twice on purpose: `_run_id` collapses "auto" into
+        # a fresh timestamp, which is what the job needs, but the coalescing key
+        # must keep "pin this run" distinct from "make a fresh one" -- otherwise
+        # every auto submit would compute its own unique key and never coalesce.
+        raw_run = str(run_id or "").strip()
+        pinned_run = (
+            ""
+            if not raw_run or raw_run.lower() == "auto"
+            else _identity(raw_run, "run_id")
+        )
+        resolved_run = _run_id(raw_run)
+        inflight_key = _inflight_key(
+            resolved_game, resolved_task, resolved_backend, resolved_options, pinned_run
+        )
 
         request_id = f"cgreq_{uuid4().hex[:20]}"
         job = _CgVideoJob(
@@ -244,26 +288,86 @@ class CgVideoGateway:
             session_id=str(session_id or ""),
             engine=str(engine or ""),
             task_meta={
-                key: task[key]
-                for key in (
+                field_name: task[field_name]
+                for field_name in (
                     "mode",
                     "model",
                     "scene",
                     "duration_sec",
                     "aspect_ratio",
                 )
-                if key in task
+                if field_name in task
             },
             playback=resolved_playback,
         )
+
+        # One critical section so that two concurrent submits for the same
+        # identity cannot both decide to generate.  The disk scan inside it is a
+        # directory glob plus a couple of small reads; the executor never holds
+        # this lock while a model is loading.
         with self._lock:
-            if key:
-                existing = self._idempotency.get(key)
+            # Idempotency comes first: a caller repeating its own key must get its
+            # own request back, even though the first call already materialized
+            # the artifact that the reuse check below would otherwise match.
+            if idem_key:
+                existing = self._idempotency.get(idem_key)
                 if existing:
                     return self._jobs[existing].to_dict()
+            # Then in-flight coalescing.  With `max_workers=1` a duplicate submit
+            # that arrives *during* a generation would otherwise queue a second
+            # full run behind the first, which is how a page reload used to
+            # double the wait instead of removing it.
+            existing = self._inflight.get(inflight_key)
+            running = self._jobs.get(existing) if existing else None
+            if running is not None:
+                return running.to_dict()
+
+            if reuse_requested:
+                hit = self._reusable_artifact(
+                    resolved_game,
+                    resolved_task,
+                    task,
+                    resolved_backend,
+                    resolved_options,
+                    pinned_run,
+                )
+                if hit is not None:
+                    stored_run, video_path = hit
+                    artifact_id = _artifact_id(resolved_game, stored_run, resolved_task)
+                    # Serve the stored run's identity so the media URL is stable
+                    # across reloads, and register the path: `media_path` only
+                    # knows this in-memory map.
+                    job.run_id = stored_run
+                    job.artifact_id = artifact_id
+                    job.video_path = str(video_path)
+                    job.state = "ready"
+                    self._jobs[request_id] = job
+                    self._artifacts[artifact_id] = video_path
+                    if idem_key:
+                        self._idempotency[idem_key] = request_id
+                    return job.to_dict()
+
+            if self.prebuilt_only:
+                # Deliberately outside the `reuse_requested` branch: a caller
+                # asking for `reuse: false` is asking for a regeneration, and
+                # that is exactly what this gateway does not do.  The clip this
+                # task names is produced during game production, so a miss means
+                # the two are out of step -- say so and let the caller decide.
+                job.error = (
+                    f"CG-video task {resolved_task!r} has no pre-generated "
+                    "artifact; this gateway serves prebuilt clips only"
+                )
+                job.state = "failed"
+                self._jobs[request_id] = job
+                if idem_key:
+                    self._idempotency[idem_key] = request_id
+                return job.to_dict()
+
+            job.inflight_key = inflight_key
             self._jobs[request_id] = job
-            if key:
-                self._idempotency[key] = request_id
+            self._inflight[inflight_key] = request_id
+            if idem_key:
+                self._idempotency[idem_key] = request_id
         self._executor.submit(self._run, job, task, resolved_options)
         return job.to_dict()
 
@@ -284,12 +388,217 @@ class CgVideoGateway:
         with self._lock:
             path = self._artifacts.get(value)
         if path is None:
+            # A gateway restart forgets every artifact id it handed out.  The id is
+            # a pure function of the on-disk layout, so the index is rebuilt from
+            # disk rather than persisted.
+            self._scan_artifacts()
+            with self._lock:
+                path = self._artifacts.get(value)
+        if path is None:
             raise KeyError(f"Unknown CG-video artifact_id: {value}")
         resolved = path.expanduser().resolve(strict=False)
         _within(resolved, self.output_root, "CG-video artifact")
         if not resolved.is_file():
             raise FileNotFoundError(f"CG-video artifact does not exist: {resolved}")
         return resolved
+
+    def _scan_artifacts(self) -> None:
+        """Index every materialized artifact under the output root by artifact id."""
+
+        # <root>/<game_id>/<run_id>/assets/cg_video/<task_id>/video.mp4
+        pattern = f"*/*/assets/{TASK_KIND}/*/{VIDEO_FILENAME}"
+        discovered: dict[str, Path] = {}
+        for video in self.output_root.glob(pattern):
+            # <root>/<game_id>/<run_id>/assets/cg_video/<task_id>/video.mp4
+            parts = video.parts
+            if len(parts) < 6:
+                continue
+            game_id, run_id, task_id = parts[-6], parts[-5], parts[-2]
+            if not (video.parent / "meta.json").is_file():
+                continue
+            discovered.setdefault(
+                _artifact_id(game_id, run_id, task_id), video
+            )
+        with self._lock:
+            for artifact_id, path in discovered.items():
+                self._artifacts.setdefault(artifact_id, path)
+
+    @staticmethod
+    def _asset_fingerprint(
+        task: Mapping[str, Any],
+        backend: str,
+        options: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """The generation inputs that determine an artifact's pixels.
+
+        The values mirror the defaults in :meth:`_default_model_factory` rather
+        than the raw task row, because ``meta.json`` records *effective* values
+        (a task with no ``seed`` is stored as ``seed: 42``).  Comparing effective
+        to effective is what makes an unseeded task still reusable.
+        """
+
+        opts = dict(options)
+        runtime = str(
+            opts.get("minimax_runtime")
+            or os.environ.get("MINIMAX_H3_RUNTIME")
+            or "local"
+        ).strip().lower()
+        cloud = backend == "seedance" or (
+            backend == "minimax-h3" and runtime == "api"
+        )
+        fingerprint: dict[str, Any] = {
+            "mode": str(task.get("mode") or "text_to_video"),
+            "prompt": str(task.get("prompt") or ""),
+            "duration_sec": float(task.get("duration_sec", 5)),
+            "seed": int(task.get("seed", 42)),
+            "first_frame_path": _comparable_path(task.get("first_frame_path")),
+            "last_frame_path": _comparable_path(task.get("last_frame_path")),
+            "reference_image_paths": _comparable_path_list(
+                task.get("reference_image_paths")
+            ),
+            "runtime": "api" if cloud else "local",
+        }
+        if cloud:
+            fingerprint.update(
+                {
+                    "resolution": str(opts.get("resolution") or "720p"),
+                    "ratio": str(
+                        opts.get("ratio") or task.get("aspect_ratio") or "16:9"
+                    ),
+                    "generate_audio": bool(opts.get("generate_audio", True)),
+                    "watermark": bool(opts.get("watermark", False)),
+                }
+            )
+        else:
+            fingerprint.update(
+                {
+                    "width": int(opts.get("width", task.get("video_width") or 864)),
+                    "height": int(opts.get("height", task.get("video_height") or 480)),
+                    "fps": float(opts.get("fps", 24.0)),
+                    "steps": int(opts.get("steps", 20)),
+                    "scheduler": str(opts.get("scheduler") or "simple"),
+                    "sampler": str(opts.get("sampler_mode") or "res_multistep"),
+                }
+            )
+        return fingerprint
+
+    @staticmethod
+    def _stored_fingerprint(meta: Mapping[str, Any]) -> dict[str, Any] | None:
+        """Read the same fingerprint back out of a stored ``meta.json``.
+
+        Returns ``None`` when the file cannot be trusted to describe a real
+        generation.  Requiring ``model_call.runtime`` is what keeps a test stub's
+        artifact -- whose ``last_call_info`` has no ``runtime`` -- from being
+        mistaken for a reusable one.
+        """
+
+        model_call = meta.get("model_call")
+        if not isinstance(model_call, Mapping):
+            return None
+        runtime = str(model_call.get("runtime") or "").strip().lower()
+        if not runtime:
+            return None
+        if any(field_name not in meta for field_name in REUSE_REQUIRED_TASK_FIELDS):
+            return None
+        try:
+            stored: dict[str, Any] = {
+                "mode": str(meta.get("mode") or ""),
+                "prompt": str(meta.get("prompt") or ""),
+                "duration_sec": float(meta["duration_sec"]),
+                "seed": int(meta["seed"]),
+                "first_frame_path": _comparable_path(meta.get("first_frame_path")),
+                "last_frame_path": _comparable_path(meta.get("last_frame_path")),
+                "reference_image_paths": _comparable_path_list(
+                    meta.get("reference_image_paths")
+                ),
+                "runtime": runtime,
+            }
+        except (TypeError, ValueError):
+            return None
+        for field_name, coerce in (
+            ("width", int),
+            ("height", int),
+            ("steps", int),
+            ("fps", float),
+            ("scheduler", str),
+            ("sampler", str),
+        ):
+            value = model_call.get(field_name)
+            if value is None:
+                continue
+            try:
+                stored[field_name] = coerce(value)
+            except (TypeError, ValueError):
+                return None
+        return stored
+
+    def _artifact_candidates(
+        self,
+        game_id: str,
+        task_id: str,
+        run_id: str,
+    ) -> list[tuple[str, Path, Path]]:
+        """Stored ``(run_id, video_path, meta_path)`` triples, newest first.
+
+        Ordered by the ``meta.json`` mtime rather than by run directory name: run
+        directories are not all timestamps (a hand-made ``--run-id`` is arbitrary),
+        so lexicographic order does not mean chronological order.  An explicit
+        ``run_id`` scopes the scan to that run alone.
+        """
+
+        roots = (
+            [paths.run_dir(game_id, run_id)]
+            if run_id
+            else [entry for entry in paths.game_output_dir(game_id).glob("*") if entry.is_dir()]
+        )
+        found: list[tuple[float, str, Path, Path]] = []
+        for root in roots:
+            task_dir = root / "assets" / TASK_KIND / task_id
+            video = task_dir / VIDEO_FILENAME
+            meta = task_dir / "meta.json"
+            if not (video.is_file() and meta.is_file()):
+                continue
+            try:
+                mtime = meta.stat().st_mtime
+            except OSError:
+                continue
+            found.append((mtime, root.name, video, meta))
+        found.sort(key=lambda item: (item[0], item[1]), reverse=True)
+        return [(run, video, meta) for _mtime, run, video, meta in found]
+
+    def _reusable_artifact(
+        self,
+        game_id: str,
+        task_id: str,
+        task: Mapping[str, Any],
+        backend: str,
+        options: Mapping[str, Any],
+        run_id: str = "",
+    ) -> tuple[str, Path] | None:
+        """Return ``(run_id, video_path)`` of the newest matching artifact."""
+
+        current = self._asset_fingerprint(task, backend, options)
+        for stored_run, video, meta in self._artifact_candidates(
+            game_id, task_id, run_id
+        ):
+            try:
+                data = json.loads(meta.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            if not isinstance(data, Mapping):
+                continue
+            stored = self._stored_fingerprint(data)
+            if stored is None or not _fingerprints_match(stored, current):
+                continue
+            resolved = video.expanduser().resolve(strict=False)
+            try:
+                _within(resolved, self.output_root, "CG-video artifact")
+            except ValueError:
+                continue
+            if not resolved.is_file():
+                continue
+            return stored_run, resolved
+        return None
 
     def _run(
         self,
@@ -325,6 +634,14 @@ class CgVideoGateway:
                 job.error = f"{type(exc).__name__}: {exc}"
                 job.updated_at = time()
                 job.state = "failed"
+        finally:
+            # Release the coalescing slot as soon as the run stops running, so a
+            # later submit re-checks the disk and can still hit the artifact this
+            # run just wrote.
+            with self._lock:
+                if job.inflight_key is not None:
+                    self._inflight.pop(job.inflight_key, None)
+                    job.inflight_key = None
 
     def _set_state(self, job: _CgVideoJob, state: str) -> None:
         if state not in JOB_STATES:
@@ -643,6 +960,68 @@ def _playback(value: Mapping[str, Any] | None) -> dict[str, bool]:
             f"Unsupported CG-video playback options: {', '.join(unknown)}"
         )
     return {key: bool(source[key]) for key in sorted(source)}
+
+
+def _comparable_path(value: Any) -> str:
+    """Normalize a task path so two spellings of one file compare equal.
+
+    ``resolve_input_path`` only falls back to the repo root when the path does not
+    already exist relative to the *process* CWD, so the same stored string can
+    resolve differently between two runs.  Absolutizing both sides removes CWD
+    from the comparison.
+    """
+
+    if value is None:
+        return ""
+    text = str(value).strip()
+    if not text:
+        return ""
+    return str(Path(paths.resolve_input_path(text)).expanduser().resolve(strict=False))
+
+
+def _comparable_path_list(value: Any) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if isinstance(value, (str, Path)):
+        return (_comparable_path(value),)
+    try:
+        return tuple(_comparable_path(item) for item in value)
+    except TypeError:
+        return ()
+
+
+def _fingerprints_match(stored: Mapping[str, Any], current: Mapping[str, Any]) -> bool:
+    """Whether a stored artifact still describes the current request.
+
+    Only keys the *stored* side recorded are compared: different backends record
+    different ``model_call`` fields (seedance has no ``width``/``steps``), and a
+    key the artifact never recorded is not evidence of a mismatch.
+    """
+
+    for field_name, stored_value in stored.items():
+        if field_name not in current:
+            continue
+        if current[field_name] != stored_value:
+            return False
+    return True
+
+
+def _inflight_key(
+    game_id: str,
+    task_id: str,
+    backend: str,
+    options: Mapping[str, Any],
+    pinned_run: str,
+) -> tuple[Any, ...]:
+    """Identify "the same generation request" for in-flight coalescing."""
+
+    return (
+        game_id,
+        task_id,
+        backend,
+        pinned_run,
+        json.dumps(dict(options), sort_keys=True, default=str),
+    )
 
 
 def _artifact_id(game_id: str, run_id: str, task_id: str) -> str:

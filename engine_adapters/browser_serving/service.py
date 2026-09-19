@@ -32,6 +32,7 @@ class BrowserServingService:
         self.cg_video = cg_video or CgVideoGateway(
             enabled=config.cg_video_enabled,
             allow_cloud=config.cg_video_allow_cloud,
+            prebuilt_only=config.cg_video_prebuilt_only,
             max_workers=config.cg_video_max_workers,
         )
 

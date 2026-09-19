@@ -59,6 +59,7 @@ class BrowserServingConfig:
     pixel_start_timeout: float = 120.0
     cg_video_enabled: bool = True
     cg_video_allow_cloud: bool = False
+    cg_video_prebuilt_only: bool = False
     cg_video_max_workers: int = 1
 
     @classmethod
@@ -203,6 +204,10 @@ class BrowserServingConfig:
             ),
             cg_video_allow_cloud=_flag(
                 "A3GAME_BROWSER_CG_VIDEO_ALLOW_CLOUD",
+                False,
+            ),
+            cg_video_prebuilt_only=_flag(
+                "A3GAME_BROWSER_CG_VIDEO_PREBUILT_ONLY",
                 False,
             ),
             cg_video_max_workers=int(
